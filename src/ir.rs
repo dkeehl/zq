@@ -2,37 +2,63 @@ use crate::vm::{Word, Instr};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::borrow::Borrow;
+use std::fmt;
 
 #[derive(Debug)]
 pub enum Expr {
     Const(u64),
-    Var(u64),
+    Var(Variable),
     Let(Box<Expr>, Box<Expr>),
-    App(String, Box<Expr>),
+    Lam(Type, Box<Expr>),
+    App(Box<Expr>, Box<Expr>, Vec<Box<Expr>>),
 
     Add(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Debug)]
+pub enum Variable {
+    Free(String),
+    Bounded(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Nat,
+    Arrow(Box<Type>, Box<Type>),
+}
+
+impl Type {
+    pub fn is_arrow(&self) -> bool {
+        if let Type::Arrow(_, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn arrow<T: Into<Box<Type>>, S: Into<Box<Type>>>(l: T, r: S) -> Type {
+        Type::Arrow(l.into(), r.into())
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Type::Nat => write!(f, "Nat"),
+            Type::Arrow(l, r) => if l.is_arrow() {
+                write!(f, "({}) -> {}", l, r)
+            } else {
+                write!(f, "{} -> {}", l, r)
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Function {
     pub name: Rc<String>,
-    pub ty: (Type, Type),
+    pub ty: Type,
     body: Box<Expr>,
-}
-
-impl Function {
-    pub fn new<T: Into<Rc<String>>>(name: T, body: Box<Expr>) -> Function {
-        Function {
-            name: name.into(),
-            ty: (Type::Nat, Type::Nat),
-            body,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -58,8 +84,8 @@ impl Gamma {
         self.data.push(t)
     }
 
-    fn pop(&mut self) {
-        let _ = self.data.pop();
+    fn pop(&mut self) -> Option<Type> {
+        self.data.pop()
     }
 
     pub fn clear(&mut self) {
@@ -75,21 +101,37 @@ impl Expr {
     pub fn typing(&self, gamma: &mut Gamma, global: &Global) -> TResult<Type> {
         match self {
             Expr::Const(_) => Ok(Type::Nat),
-            Expr::Var(i) => Ok(gamma.get(*i)),
+            Expr::Var(Variable::Bounded(i)) => Ok(gamma.get(*i)),
+            Expr::Var(Variable::Free(s)) => global.try_lookup(&s[..]).map(|t| t.clone()),
             Expr::Let(e0, e1) => {
-                let ty0 = e0.typing(gamma, global)?;
-                gamma.add(ty0);
+                let t0 = e0.typing(gamma, global)?;
+                gamma.add(t0);
                 let ret = e1.typing(gamma, global);
                 gamma.pop();
                 ret
             },
-            Expr::App(f, param) => {
-                let ty = param.typing(gamma, global)?;
-                let (t0, t1) = global.try_lookup(&f[..])?;
-                if &ty == t0 {
-                    Ok(t1.clone())
-                } else {
-                    Err(TypeError::Unexpected)
+            Expr::Lam(t, e) => {
+                gamma.add(t.clone());
+                let t1 = e.typing(gamma, global)?;
+                let t0 = gamma.pop().unwrap();
+                Ok(Type::Arrow(Box::new(t0), Box::new(t1)))
+            },
+            Expr::App(f, arg, args) => {
+                let mut t_f = &f.typing(gamma, global)?;
+                let mut t_x = arg.typing(gamma, global)?;
+                let mut args = args.iter();
+                loop {
+                    match t_f {
+                        Type::Arrow(t0, t1) if &**t0 == &t_x => {
+                            if let Some(e) = args.next() {
+                                t_f = &*t1;
+                                t_x = e.typing(gamma, global)?;
+                            } else {
+                                return Ok((**t1).clone());
+                            };
+                        },
+                        _ => return Err(TypeError::Unexpected),
+                    }
                 }
             },
 
@@ -108,35 +150,92 @@ impl Expr {
         }
     }
 
-    pub fn compile(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) {
+    pub fn compile_non_tail(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) -> u64 {
         match self {
             Expr::Const(v) => {
-                let inst = Instr::Load(Word(*v));
+                let inst = Instr::Load(Word::try_from(*v).unwrap());
                 out.push(inst);
+                1
             },
-            Expr::Var(i) => {
-                let inst = Instr::Fetch(Word(*i));
+            Expr::Var(Variable::Bounded(i)) => {
+                let inst = Instr::Fetch(Word(i - 1));
                 out.push(inst);
+                1
+            },
+            Expr::Var(Variable::Free(s)) => {
+                let addr = name_table.lookup(&s[..]);
+                let inst = Instr::MkClosure(*addr);
+                out.push(inst);
+                1
             },
             Expr::Let(e0, e1) => {
-                e0.compile(name_table, out);
-                out.push(Instr::PushA);
-                e1.compile(name_table, out);
-                out.push(Instr::Pop);
+                let l0 = e0.compile_non_tail(name_table, out);
+                out.push(Instr::Let);
+                let l1 = e1.compile_non_tail(name_table, out);
+                out.push(Instr::EndLet);
+                l0 + l1 + 2
             },
-            Expr::App(f, param) => {
-                let addr = name_table.lookup(&f[..]);
-                out.push(Instr::Push(*addr));
-                param.compile(name_table, out);
-                out.push(Instr::Call);
+            Expr::Lam(_, e) => {
+                let i = out.len();
+                out.push(Instr::Halt);
+                let l = e.compile_tail(name_table, out);
+                out.push(Instr::Return);
+                out[i] = Instr::LFJF(Word(l + 2));
+                l + 2
             },
+            Expr::App(f, arg, args) => Self::compile_app(f, arg, args, name_table, out, false),
             Expr::Add(e0, e1) => {
-                e0.compile(name_table, out);
+                let l0 = e0.compile_non_tail(name_table, out);
                 out.push(Instr::PushA);
-                e1.compile(name_table, out);
+                let l1 = e1.compile_non_tail(name_table, out);
                 out.push(Instr::Add);
+                l0 + l1 + 2
             },
         }
+    }
+
+    fn compile_tail(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) -> u64 {
+        match self {
+            Expr::Let(e0, e1) => {
+                let l1 = e0.compile_non_tail(name_table, out);
+                out.push(Instr::Let);
+                let l2 = e1.compile_tail(name_table, out);
+                l1 + l2 + 1
+            },
+            Expr::Lam(_, e) => {
+                out.push(Instr::Grab);
+                let l = e.compile_tail(name_table, out);
+                l + 1
+            },
+            Expr::App(f, arg, args) => Self::compile_app(f, arg, args, name_table, out, true),
+            _ => self.compile_non_tail(name_table, out),
+        }
+    }
+
+    fn compile_app(f: &Box<Expr>, arg: &Box<Expr>, args: &Vec<Box<Expr>>, 
+        name_table: &NameTable<Word>, out: &mut Vec<Instr>, tail_call: bool) -> u64
+    {
+        out.push(Instr::PushMark);
+        let mut l = 0;
+        for x in args.iter().rev() {
+            let l_x = x.compile_non_tail(name_table, out);
+            out.push(Instr::PushA);
+            l += l_x + 1;
+        }
+        let l0 = arg.compile_non_tail(name_table, out);
+        out.push(Instr::PushA);
+        let l1 = f.compile_non_tail(name_table, out);
+        let inst = if tail_call {
+            Instr::TailApply
+        } else {
+            Instr::Apply
+        };
+        out.push(inst);
+        l + l0 + l1 + 3
+    }
+
+    pub fn compile(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) {
+        let _ = self.compile_tail(name_table, out);
     }
 }
 
@@ -180,13 +279,20 @@ impl<T> NameTable<T> {
     }
 }
 
-type Global = NameTable<(Type, Type)>;
+type Global = NameTable<Type>;
 
 impl Function {
+    pub fn new<T: Into<Rc<String>>>(name: T, ty: Type, body: Box<Expr>) -> Function {
+        Function {
+            name: name.into(),
+            ty,
+            body,
+        }
+    }
+
     pub fn type_check(&self, gamma: &mut Gamma, global: &Global) -> TResult<()> {
-        gamma.add(self.ty.0.clone());
         let t = self.body.typing(gamma, global)?;
-        if t == self.ty.1 {
+        if t == self.ty {
             Ok(())
         } else {
             Err(TypeError::Unexpected)
@@ -194,10 +300,12 @@ impl Function {
     }
 
     pub fn compile(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) {
-        out.push(Instr::PushA);
-        self.body.compile(name_table, out);
-        out.push(Instr::Pop);
-        out.push(Instr::Return);
+        if let Expr::Lam(_, ref e) = *self.body {
+            e.compile_tail(name_table, out);
+            out.push(Instr::Return);
+        } else {
+            unreachable!()
+        }
     }
 }
 

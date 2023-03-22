@@ -38,7 +38,7 @@ pub fn run_repl() {
 struct Interpretor {
     vm: VM,
     prog: Program,
-    global: NameTable<(Type, Type)>,
+    global: NameTable<Type>,
     name_table: NameTable<Word>,
     buffer: Vec<Instr>,
 }
@@ -66,12 +66,16 @@ impl Interpretor {
             Item::Expression(e) => {
                 let e = e.de_bruijn_index();
                 let mut gamma = Gamma::new();
-                let _ = e.typing(&mut gamma, &self.global)?;
-                e.compile(&self.name_table, &mut self.buffer);
+                let t = e.typing(&mut gamma, &self.global)?;
+                let _ = e.compile_non_tail(&self.name_table, &mut self.buffer);
                 self.buffer.push(Instr::Halt);
+                // for i in self.buffer.iter() {
+                //     println!("{}", i);
+                // }
                 let addr = self.prog.append(&mut self.buffer);
                 let res = self.vm.run(&self.prog, addr);
-                println!("{:?}", res);
+                self.vm.print(res, &t);
+                self.vm.free_mem();
             },
             Item::FunDef(f) => {
                 let f = f.de_bruijn_index();

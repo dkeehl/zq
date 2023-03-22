@@ -36,7 +36,7 @@ pub enum Token<'a> {
     TkWhitespace,
     TkComment,
     TkOp(Operator),
-    TkSeparater(char),
+    TkDelim(Delimiter),
 }
 
 impl<'a> fmt::Display for Token<'a> {
@@ -49,7 +49,7 @@ impl<'a> fmt::Display for Token<'a> {
             Token::TkWhitespace => write!(f, "Whitespace"),
             Token::TkComment => write!(f, "Comment"),
             Token::TkOp(op) => write!(f, "Operator {}", op),
-            Token::TkSeparater(sym) => write!(f, "Seperater {}", sym),
+            Token::TkDelim(sym) => write!(f, "Delimiter {}", sym),
         }
     }
 }
@@ -69,7 +69,11 @@ pub enum Operator {
     Minus,
     Star,
     Slash,
-    Equal,
+    EQ,
+    GT,
+    GTE,
+    LT,
+    LTE,
 }
 
 impl fmt::Display for Operator {
@@ -84,7 +88,7 @@ impl Operator {
         match self {
             Plus | Minus => (40, 41),    
             Star | Slash => (50, 51),   
-            Equal => (31, 30),   
+            EQ | GT | GTE | LT | LTE => (31, 30),   
         }
     }
 
@@ -94,7 +98,23 @@ impl Operator {
             Operator::Minus => "-",
             Operator::Star  => "*",
             Operator::Slash => "/",
-            Operator::Equal => "=",
+            Operator::EQ    => "==",
+            Operator::GT    => ">",
+            Operator::GTE   => ">=",
+            Operator::LT    => "<",
+            Operator::LTE   => "<=",
+        }
+    }
+
+    fn parse_char(c: char) -> Self {
+        match c {
+            '+' => Operator::Plus,
+            '-' => Operator::Minus,
+            '*' => Operator::Star,
+            '/' => Operator::Slash,
+            '>' => Operator::GT,
+            '<' => Operator::LT,
+            _ => unreachable!(),
         }
     }
 }
@@ -136,7 +156,8 @@ enum LState {
     StKeyword(Keyword),
     StWhiteSpace,
     StComment,
-    StSlash,
+    StOp(Operator),
+    StDelim(Delimiter),
 }
 
 // pub type Lines<'a> = Vec<&'a str>;
@@ -181,60 +202,106 @@ impl<'a> Scanner<'a> {
                 '0'..='9' => match self.state {
                     Start => self.new_token(StInteger),
                     StKeyword(_) => self.state = StIdent,
-                    StSlash | StWhiteSpace => {
+                    StOp(_) | StDelim(_) | StWhiteSpace => {
                         self.commit();
                         self.new_token(StInteger);
                     },
-                    _ => {},
+                    StIdent | StCapitalized | StComment | StInteger => {},
                 },
 
                 '_' => match self.state {
                     Start => self.new_token(StIdent),
                     StKeyword(_) => self.state = StIdent,
-                    StWhiteSpace | StSlash => {
+                    StWhiteSpace | StDelim(_) | StOp(_) => {
                         self.commit();
                         self.new_token(StIdent);
                     },
-                    _ => {},
+                    StIdent | StCapitalized | StComment | StInteger => {},
                 },
 
                 c @ 'a'..='z' => match self.state {
                     Start => self.keyword_or_identifier(c),
                     StKeyword(_) => self.state = StIdent,
                     StInteger => return self.unrecognized(),
-                    StWhiteSpace | StSlash => {
+                    StWhiteSpace | StOp(_) | StDelim(_) => {
                         self.commit();
                         self.keyword_or_identifier(c)
                     },
-                    _ => {},
+                    StIdent | StCapitalized | StComment => {},
                 },
                     
                 'A'..='Z' => match self.state {
                     Start => self.new_token(StCapitalized),
                     StInteger => return self.unrecognized(),
                     StKeyword(_) => self.state = StIdent,
-                    StWhiteSpace | StSlash => {
+                    StWhiteSpace | StOp(_) | StDelim(_) => {
                         self.commit();
                         self.new_token(StCapitalized);
                     },
-                    _ => {},
+                    StIdent | StCapitalized | StComment => {},
                 },
                 
-                '+' => self.one_char_token(Token::TkOp(Operator::Plus)),
-                '-' => self.one_char_token(Token::TkOp(Operator::Minus)),
-                '*' => self.one_char_token(Token::TkOp(Operator::Star)),
-                '=' => self.one_char_token(Token::TkOp(Operator::Equal)),
-
-                c @ ('{' | '}' | '(' | ')' | '[' | ']') =>
-                    self.one_char_token(Token::TkSeparater(c)),
-
-                '/' => match self.state {
-                    Start => self.new_token(StSlash),
+                c @ ('{' | '}' | '(' | ')' | '[' | ']' | ',' | ':' | '.' | ';' | '\\') => match self.state {
                     StComment => {},
-                    StSlash => self.state = StComment,
+                    Start => {
+                        let d = Delimiter::parse_char(c);
+                        self.new_token(StDelim(d))
+                    },
                     _ => {
                         self.commit();
-                        self.new_token(StSlash);
+                        let d = Delimiter::parse_char(c);
+                        self.new_token(StDelim(d))
+                    },
+                },
+
+                c @ ('+' | '-' | '*') => match self.state {
+                    StComment => {},
+                    Start => {
+                        let op = Operator::parse_char(c);
+                        self.new_token(StOp(op))
+                    },
+                    _ => {
+                        self.commit();
+                        let op = Operator::parse_char(c);
+                        self.new_token(StOp(op))
+                    },
+                },
+
+                '=' => match self.state {
+                    Start => self.new_token(StDelim(Delimiter::Equal)),
+                    StComment => {},
+                    // ==
+                    StDelim(Delimiter::Equal) => self.state = StOp(Operator::EQ),
+                    // <=
+                    StOp(Operator::LT) => self.state = StOp(Operator::LTE),
+                    // >=
+                    StOp(Operator::GT) => self.state = StOp(Operator::GTE),
+                    _ => {
+                        self.commit();
+                        self.new_token(StDelim(Delimiter::Equal));
+                    },
+                },
+
+                '>' => match self.state {
+                    Start => self.new_token(StOp(Operator::GT)),
+                    StComment => {},
+                    // ->
+                    StOp(Operator::Minus) => self.state = StDelim(Delimiter::Arrow),
+                    // =>
+                    StDelim(Delimiter::Equal) => self.state = StDelim(Delimiter::FatArrow),
+                    _ => {
+                        self.commit();
+                        self.new_token(StOp(Operator::GT));
+                    },
+                },
+
+                '/' => match self.state {
+                    Start => self.new_token(StOp(Operator::Slash)),
+                    StComment => {},
+                    StOp(Operator::Slash) => self.state = StComment,
+                    _ => {
+                        self.commit();
+                        self.new_token(StOp(Operator::Slash));
                     },
                 },
                 
@@ -270,20 +337,6 @@ impl<'a> Scanner<'a> {
         self.token_col = self.col;
     }
 
-    fn one_char_token(&mut self, tok: Token<'a>) {
-        match self.state {
-            LState::StComment => {},
-            _ => {
-                self.commit();
-                let i = self.offset;
-                let loc = Location::new((i..i+1), self.row, self.col);
-                let token = LToken { tok, loc };
-                self.tokens.push(token);
-                self.state = LState::Start;
-            },
-        }
-    }
-
     fn commit(&mut self) {
         use LState::*;
         match self.state {
@@ -301,7 +354,9 @@ impl<'a> Scanner<'a> {
 
                     StKeyword(w) => Token::TkKeyWord(w),
 
-                    StSlash => Token::TkOp(Operator::Slash),
+                    StOp(op) => Token::TkOp(op),
+
+                    StDelim(d) => Token::TkDelim(d),
 
                     _ => unreachable!(),
                 };
@@ -355,6 +410,73 @@ impl<'a> Scanner<'a> {
         self.chars = s[count..].chars();
         self.offset += count;
         self.col += count;
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum Delimiter {
+    ParL,
+    ParR,
+    BraceL,
+    BraceR,
+    SquareL,
+    SquareR,
+    Comma,
+    Dot,
+    Colon,
+    SemiColon,
+    Equal,
+    BackSlash,
+
+    Arrow,
+    FatArrow,
+}
+
+impl Delimiter {
+    pub fn inspect(&self) -> &'static str {
+        use Delimiter::*;
+        match self {
+            ParL => "(",
+            ParR => ")",
+            BraceL => "{",
+            BraceR => "}",
+            SquareL => "[",
+            SquareR => "]",
+            Comma => ",",
+            Dot => ".",
+            Colon => ":",
+            SemiColon => ";",
+            Equal => "=",
+            BackSlash => "\\",
+
+            Arrow => "->",
+            FatArrow => "=>",
+        }
+    }
+
+    fn parse_char(c: char) -> Self {
+        use Delimiter::*;
+        match c {
+            '(' => ParL,
+            ')' => ParR,
+            '{' => BraceL,
+            '}' => BraceR,
+            '[' => SquareL,
+            ']' => SquareR,
+            ',' => Comma,
+            '.' => Dot,
+            ':' => Colon,
+            ';' => SemiColon,
+            '=' => Equal,
+            '\\' => BackSlash,
+            _   => unreachable!(),
+        }
+    }
+}
+
+impl fmt::Display for Delimiter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.inspect())
     }
 }
 

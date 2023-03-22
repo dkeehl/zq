@@ -1,7 +1,9 @@
-use crate::lexer::{Lexer, LToken, Token::{self,*}, Keyword, Operator, Location};
+use crate::lexer::{Lexer, LToken, Token::{self,*}, Keyword, Operator, Delimiter, Location};
 use crate::ast::{Ast, Definition, Item};
+use crate::ir::Type;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::rc::Rc;
 
 type PResult<T> = Result<T, PError>;
 
@@ -22,7 +24,7 @@ enum TokenDesc {
     Kw(Keyword),
     AnyOp,
     Op(Operator),
-    Sep,
+    Delim(Delimiter),
     Whitespace,
 }
 
@@ -34,7 +36,7 @@ impl<'a> From<&Token<'a>> for TokenDesc {
             Token::TkCapitalized(_) => Self::Type,
             Token::TkKeyWord(kw) => Self::Kw(*kw),
             Token::TkOp(op) => Self::Op(*op),
-            Token::TkSeparater(_) => Self::Sep,
+            Token::TkDelim(sym) => Self::Delim(*sym),
             Token::TkWhitespace | Token::TkComment => Self::Whitespace,
         }
     }
@@ -49,7 +51,7 @@ impl TokenDesc {
             Self::Kw(w) => w.inspect(),
             Self::AnyOp => "any operator",
             Self::Op(o) => o.inspect(),
-            Self::Sep => "seperater",
+            Self::Delim(sym) => sym.inspect(),
             Self::Whitespace => "whitespace",
         }
     }
@@ -113,16 +115,6 @@ trait Combine<'a>: Parser<'a> + Sized {
 
 impl<'a, T: Parser<'a> + Sized> Combine<'a> for T {}
 
-struct BoxedParser<T> {
-    inner: Box<dyn for<'a> Parser<'a, Output=T>>
-}
-
-fn boxed<T, P>(p: P) -> BoxedParser<T>
-where P: for<'a> Parser<'a, Output=T> + 'static
-{
-    BoxedParser { inner: Box::new(p) }
-}
-
 macro_rules! seq {
     ($a:expr, $b:expr) => {
         Combine::seq($a, $b)
@@ -151,6 +143,24 @@ where F: Fn(&mut Lexer<'a>, &mut PState) -> PResult<T>
     }
 }
 
+struct BoxedParser<T> {
+    inner: Rc<dyn for<'a> Parser<'a, Output=T>>
+}
+
+fn boxed<T, P>(p: P) -> BoxedParser<T>
+where P: for<'a> Parser<'a, Output=T> + 'static
+{
+    BoxedParser { inner: Rc::new(p) }
+}
+
+impl<T> Clone for BoxedParser<T> {
+    fn clone(&self) -> Self {
+        BoxedParser {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl<'a, T> Parser<'a> for BoxedParser<T> {
     type Output = T;
 
@@ -159,6 +169,7 @@ impl<'a, T> Parser<'a> for BoxedParser<T> {
     }
 }
 
+#[derive(Clone)]
 struct Delay<T> {
     cache: RefCell<Option<T>>,
     f: Cell<Option<fn() -> T>>
@@ -193,6 +204,7 @@ where P: Parser<'a>
 //
 // Combinators
 //
+#[derive(Clone)]
 struct Map<P, F> {
     p: P,
     f: F,
@@ -210,6 +222,7 @@ where P: Parser<'a>,
     }
 }
 
+#[derive(Clone)]
 struct Seq<A, B> {
     a: A,
     b: B,
@@ -234,6 +247,7 @@ where A: Parser<'a>,
     }
 }
 
+#[derive(Clone)]
 struct Choice<A, B> {
     a: A,
     b: B,
@@ -253,6 +267,33 @@ where A: Parser<'a, Output=T>,
             },
         }
     }
+}
+
+#[derive(Clone)]
+struct ZeroOrMore<P> {
+    p: P
+}
+
+impl<'a, P> Parser<'a> for ZeroOrMore<P>
+where P : Parser<'a>
+{
+    type Output = Vec<P::Output>;
+
+    fn parse(&self, input: &mut Lexer<'a>, state: &mut PState) -> PResult<Self::Output> {
+        let mut ret = vec![];
+        while let Ok(v) = self.p.parse(input, state) {
+            ret.push(v);
+        }
+        Ok(ret)
+    }
+}
+
+fn zero_or_more<P>(p: P) -> ZeroOrMore<P> {
+    ZeroOrMore { p }
+}
+
+fn success(input: &mut Lexer, state: &mut PState) -> PResult<()> {
+    Ok(())
 }
 
 //
@@ -283,22 +324,19 @@ macro_rules! token {
     }
 }
 
-fn integer(input: &mut Lexer, state: &mut PState) -> PResult<Ast> {
-    token!(input, Token::TkInt(n) => Ast::Int(n), TokenDesc::Number)
+fn integer(input: &mut Lexer, state: &mut PState) -> PResult<u64> {
+    token!(input, Token::TkInt(n) => n, TokenDesc::Number)
 }
 
 fn identifier<'a>(input: &mut Lexer<'a>, state: &mut PState) -> PResult<&'a str> {
     token!(input, Token::TkIdent(name) => name, TokenDesc::Identifier)
 }
 
-fn p_identifier<'a>(input: &mut Lexer<'a>, state: &mut PState) -> PResult<Ast> {
-    token!(input, Token::TkIdent(name) => Ast::Ident(name.to_string()), TokenDesc::Identifier)
-}
-
 fn op(input: &mut Lexer, state: &mut PState) -> PResult<Operator> {
     token!(input, Token::TkOp(o) => o, TokenDesc::AnyOp)
 }
 
+#[derive(Clone)]
 struct Tk(Token<'static>);
 
 fn token(tk: Token<'static>) -> Tk {
@@ -314,12 +352,12 @@ impl<'a> Parser<'a> for Tk {
 }
 
 // Pratt parser for operator precedance 
-fn pratt<'a, P>(operand: &P, input: &mut Lexer<'a>, state: &mut PState, power: u8)
-    -> PResult<(Ast, Option<(Operator, u8, u8)>)>
-    where P: Parser<'a, Output=Ast>
+fn pratt<'a, P, T, F>(operand: &P, input: &mut Lexer<'a>, state: &mut PState, power: u8, f: &F)
+    -> PResult<(T, Option<(Operator, u8, u8)>)>
+    where P: Parser<'a, Output=T>,
+          F: Fn(Operator, T, T) -> T,
 {
     let mut acc = operand.parse(input, state)?;
-    // FIXME parse only operators that do binary operations
     let mut infix = match op(input, state) {
         Ok(o) => o,
         Err(PError::Eof) | Err(PError::Unexpected {..}) => return Ok((acc, None)),
@@ -328,8 +366,8 @@ fn pratt<'a, P>(operand: &P, input: &mut Lexer<'a>, state: &mut PState, power: u
     let (mut l_pow, mut r_pow) = infix.assosiate_power();
 
     while l_pow > power {
-        let (rhs, next_infix) = pratt(operand, input, state, r_pow)?;
-        acc = Ast::Op2(infix, Box::new(acc), Box::new(rhs));
+        let (rhs, next_infix) = pratt(operand, input, state, r_pow, f)?;
+        acc = f(infix, acc, rhs);
         if let Some((next_infix, next_l_pow, next_r_pow)) = next_infix {
             infix = next_infix;
             l_pow = next_l_pow;
@@ -342,18 +380,20 @@ fn pratt<'a, P>(operand: &P, input: &mut Lexer<'a>, state: &mut PState, power: u
     Ok((acc, Some((infix, l_pow, r_pow))))
 }
 
-struct OpExpr<T> {
-    operand: T,
+struct OpExpr<P, F> {
+    operand: P,
+    f: F,
 }
 
-impl<'a, T> Parser<'a> for OpExpr<T>
-where T: Parser<'a, Output=Ast>
+impl<'a, P, T, F> Parser<'a> for OpExpr<P, F>
+where P: Parser<'a, Output=T>,
+      F: Fn(Operator, T, T) -> T,
 {
-    type Output = Ast;
+    type Output = T;
 
-    fn parse(&self, input: &mut Lexer<'a>, state: &mut PState) -> PResult<Ast> {
+    fn parse(&self, input: &mut Lexer<'a>, state: &mut PState) -> PResult<T> {
         let save = input.checkpoint();
-        match pratt(&self.operand, input, state, 0) {
+        match pratt(&self.operand, input, state, 0, &self.f) {
             Ok((x, None)) => Ok(x),
             // `pratt` returns with an empty rhs only when the left power of the op is less than the power,
             // which is 0_u8 here, and thus impossible.
@@ -369,37 +409,66 @@ where T: Parser<'a, Output=Ast>
 //
 // Sytax
 //
-fn expression() -> impl for<'a> Parser<'a, Output=Ast> {
-    boxed(choice!(p_let(), p_operator_expression()))
+
+fn parenthesised<P, T>(p: P) -> impl for<'a> Parser<'a, Output=T> + Clone
+where P: for<'a> Parser<'a, Output=T> + Clone
+{
+    seq!(token(TkDelim(Delimiter::ParL)), p, token(TkDelim(Delimiter::ParR)))
+        .map(|(_, (t, _))| t)
 }
 
-fn p_atomic() -> impl for<'a> Parser<'a, Output=Ast> {
-    let pe = seq!(token(TkSeparater('(')), delay(expression), token(TkSeparater(')')))
-        .map(|(_, (e, _))| e);
-    choice!(integer, p_identifier, pe)
+fn expression() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
+    boxed(choice!(p_let(), lambda(), p_operator_expression()))
+}
+
+fn p_atomic() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
+    let in_par = parenthesised(delay(expression));
+    choice!(p_integer(), p_identifier(), in_par)
+}
+
+fn p_integer() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
+    (integer).map(Ast::Int)
+}
+
+fn p_identifier() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
+    ident().map(Ast::Ident)
+}
+
+fn ident() -> impl for<'a> Parser<'a, Output=String> + Clone {
+    (identifier).map(str::to_string)
+}
+
+fn ty() -> impl for<'a> Parser<'a, Output=Type> + Clone {
+    let tail = seq!(token(TkDelim(Delimiter::Arrow)), delay(ty))
+        .map(|(_, t)| Some(t));
+    let tail = choice!(tail, (success).map(|_| None));
+    boxed(seq!(atomic_type(), tail).map(|(l, r)|
+        if let Some(r) = r {
+            Type::arrow(l, r)
+        } else {
+            l
+        }))
+}
+
+fn atomic_type() -> impl for<'a> Parser<'a, Output=Type> {
+    let nat = token(TkCapitalized("Nat")).map(|_| Type::Nat);
+    let in_par = parenthesised(delay(ty));
+    choice!(nat, in_par)
 }
 
 fn p_let() -> impl for<'a> Parser<'a, Output=Ast> {
-    let f = |(_, (id, (_, (e0, (_, e1))))): (_, (&str, (_, (_, (_, _)))))| {
-        let e0 = Box::new(e0);
-        let e1 = Box::new(e1);
-        Ast::Let(e0, id.to_string(), e1)
-    };
     seq!(token(TkKeyWord(Keyword::Let)),
-        identifier,
-        token(TkOp(Operator::Equal)),
+        ident(),
+        token(TkDelim(Delimiter::Equal)),
         delay(expression),
         token(TkKeyWord(Keyword::In)),
         delay(expression))
-        .map(f)
+        .map(|(_, (name, (_, (e0, (_, e1)))))| Ast::local(name, e0, e1))
 }
 
 fn p_application() -> impl for<'a> Parser<'a, Output=Ast> {
-    let f = |(f_name, param): (&str, _)| {
-        let param = Box::new(param);
-        Ast::App(f_name.to_string(), param)
-    };
-    seq!(identifier, p_atomic()).map(f)
+    seq!(p_atomic(), p_atomic(), zero_or_more(p_atomic()))
+        .map(|(f, (arg, args))| Ast::app(f, arg, args))
 }
 
 fn p_operand() -> impl for<'a> Parser<'a, Output=Ast> {
@@ -409,19 +478,33 @@ fn p_operand() -> impl for<'a> Parser<'a, Output=Ast> {
 fn p_operator_expression() -> impl for<'a> Parser<'a, Output=Ast> {
     OpExpr {
         operand: p_operand(),
+        f: Ast::op2,
     }
 }
 
+fn type_annotation<P, T>(p: P) -> impl for<'a> Parser<'a, Output=(T, Type)> + Clone
+where P: for<'a> Parser<'a, Output=T> + Clone
+{
+    seq!(p, token(TkDelim(Delimiter::Colon)), ty()).map(|(x, (_, t))| (x, t))
+}
+
+fn lambda() -> impl for<'a> Parser<'a, Output=Ast> {
+    seq!(token(TkDelim(Delimiter::BackSlash)),
+        type_annotation(ident()),
+        token(TkDelim(Delimiter::FatArrow)),
+        delay(expression))
+        .map(|(_, ((x, t), (_, e)))| Ast::lam(x, t, e))
+}
+
 fn function_def() -> impl for<'a> Parser<'a, Output=Definition> {
-    let f = |(_, (f_name, (p_name, (_, e)))): (_, (&str, (&str, (_, _))))| {
-        Definition::new(f_name, p_name, e)
-    };
+    let arg = type_annotation(ident());
+    let arg1 = seq!(token(TkDelim(Delimiter::Comma)), arg.clone()).map(|(_, x)| x);
     seq!(token(TkKeyWord(Keyword::Fun)),
-        identifier,
-        identifier,
-        token(TkOp(Operator::Equal)),
+        type_annotation(seq!(ident(), parenthesised(seq!(arg, zero_or_more(arg1))))),
+        token(TkDelim(Delimiter::Equal)),
         expression())
-        .map(f)
+        .map(|(_, (((f_name, (arg, args)), ret_type), (_, e)))|
+                Definition::new(f_name, arg, args, ret_type, e))
 }
 
 pub fn item() -> impl for<'a> Parser<'a, Output=Item> {
