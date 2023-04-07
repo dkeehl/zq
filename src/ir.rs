@@ -16,6 +16,7 @@ pub enum Expr {
     Match(Box<Expr>, Vec<(u64, usize)>, Option<usize>, Vec<Box<Expr>>),
 
     Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -170,7 +171,7 @@ impl Expr {
                 }
             },
 
-            Expr::Add(e0, e1) => {
+            Expr::Add(e0, e1) | Expr::Sub(e0, e1) => {
                 let t0 = e0.typing(gamma, global)?;
                 if t0 != Type::Nat {
                     return Err(TypeError::Unexpected);
@@ -226,10 +227,18 @@ impl Expr {
             Expr::Match(_, _, _, _) => unreachable!(),
 
             Expr::Add(e0, e1) => {
-                let l0 = e0.compile_non_tail(name_table, out);
-                out.push(Instr::PushA);
                 let l1 = e1.compile_non_tail(name_table, out);
+                out.push(Instr::PushA);
+                let l0 = e0.compile_non_tail(name_table, out);
                 out.push(Instr::Add);
+                l0 + l1 + 2
+            },
+
+            Expr::Sub(e0, e1) => {
+                let l1 = e1.compile_non_tail(name_table, out);
+                out.push(Instr::PushA);
+                let l0 = e0.compile_non_tail(name_table, out);
+                out.push(Instr::Sub);
                 l0 + l1 + 2
             },
         }

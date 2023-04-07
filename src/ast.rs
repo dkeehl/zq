@@ -209,12 +209,12 @@ impl Ast {
                 }
             },
             Ast::Op2(op, a0, a1) => {
-                if op == &Operator::Plus {
-                    let e0 = a0.de_bruijn_index_prim(names.clone(), depth);
-                    let e1 = a1.de_bruijn_index_prim(names, depth);
-                    Box::new(Expr::Add(e0, e1))
-                } else {
-                    unimplemented!()
+                let e0 = a0.de_bruijn_index_prim(names.clone(), depth);
+                let e1 = a1.de_bruijn_index_prim(names, depth);
+                match op {
+                    Operator::Plus => Box::new(Expr::Add(e0, e1)),
+                    Operator::Minus => Box::new(Expr::Sub(e0, e1)),
+                    _ => unimplemented!(),
                 }
             },
             Ast::Lam(x, t, e) => {
