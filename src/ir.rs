@@ -1,4 +1,5 @@
 use crate::vm::{Word, Instr};
+use crate::ast::Identifier;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::borrow::Borrow;
@@ -11,13 +12,15 @@ pub enum Expr {
     Let(Box<Expr>, Box<Expr>),
     Lam(Type, Box<Expr>),
     App(Box<Expr>, Box<Expr>, Vec<Box<Expr>>),
+    //     target    jump table         default        blocks
+    Match(Box<Expr>, Vec<(u64, usize)>, Option<usize>, Vec<Box<Expr>>),
 
     Add(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug)]
 pub enum Variable {
-    Free(String),
+    Free(Identifier),
     Bounded(u64),
 }
 
@@ -56,7 +59,7 @@ impl fmt::Display for Type {
 
 #[derive(Debug)]
 pub struct Function {
-    pub name: Rc<String>,
+    pub name: Identifier,
     pub ty: Type,
     body: Box<Expr>,
 }
@@ -65,6 +68,9 @@ pub struct Function {
 pub enum TypeError {
     Unexpected,
     Undefined(String),
+    IncompatibleTypes,
+    EmptyMatch,
+    NonExhaustivePattern,
 }
 
 type TResult<T> = Result<T, TypeError>;
@@ -98,11 +104,18 @@ impl Gamma {
 }
 
 impl Expr {
+    fn is_var(&self) -> bool {
+        match self {
+            Expr::Var(Variable::Bounded(_)) => true,
+            _ => false,
+        }
+    }
+
     pub fn typing(&self, gamma: &mut Gamma, global: &Global) -> TResult<Type> {
         match self {
             Expr::Const(_) => Ok(Type::Nat),
             Expr::Var(Variable::Bounded(i)) => Ok(gamma.get(*i)),
-            Expr::Var(Variable::Free(s)) => global.try_lookup(&s[..]).map(|t| t.clone()),
+            Expr::Var(Variable::Free(x)) => global.try_lookup(x).map(|t| t.clone()),
             Expr::Let(e0, e1) => {
                 let t0 = e0.typing(gamma, global)?;
                 gamma.add(t0);
@@ -134,6 +147,28 @@ impl Expr {
                     }
                 }
             },
+            Expr::Match(e, pat, e0, e1) => {
+                let t = e.typing(gamma, global)?;
+                if t != Type::Nat {
+                    return Err(TypeError::Unexpected);
+                }
+                if e0.is_none() {
+                    return Err(TypeError::NonExhaustivePattern);
+                }
+                match e1.as_slice() {
+                    [] => Err(TypeError::EmptyMatch),
+                    [e] => e.typing(gamma, global),
+                    [e, ref tail @ ..] => {
+                        let t = e.typing(gamma, global)?;
+                        for e in tail {
+                            if e.typing(gamma, global)? != t {
+                                return Err(TypeError::IncompatibleTypes);
+                            }
+                        }
+                        Ok(t)
+                    },
+                }
+            },
 
             Expr::Add(e0, e1) => {
                 let t0 = e0.typing(gamma, global)?;
@@ -162,8 +197,8 @@ impl Expr {
                 out.push(inst);
                 1
             },
-            Expr::Var(Variable::Free(s)) => {
-                let addr = name_table.lookup(&s[..]);
+            Expr::Var(Variable::Free(x)) => {
+                let addr = name_table.lookup(x);
                 let inst = Instr::MkClosure(*addr);
                 out.push(inst);
                 1
@@ -184,6 +219,12 @@ impl Expr {
                 l + 2
             },
             Expr::App(f, arg, args) => Self::compile_app(f, arg, args, name_table, out, false),
+            Expr::Match(e, pat, Some(default), es) => {
+                Self::compile_match(Self::compile_non_tail, name_table, out,
+                    e, &pat[..], *default, &es[..])
+            },
+            Expr::Match(_, _, _, _) => unreachable!(),
+
             Expr::Add(e0, e1) => {
                 let l0 = e0.compile_non_tail(name_table, out);
                 out.push(Instr::PushA);
@@ -208,6 +249,12 @@ impl Expr {
                 l + 1
             },
             Expr::App(f, arg, args) => Self::compile_app(f, arg, args, name_table, out, true),
+            Expr::Match(e, pat, Some(default), es) => {
+                Self::compile_match(Self::compile_tail, name_table, out,
+                    e, &pat[..], *default, &es[..])
+            },
+            Expr::Match(_, _, _, _) => unreachable!(),
+
             _ => self.compile_non_tail(name_table, out),
         }
     }
@@ -234,28 +281,59 @@ impl Expr {
         l + l0 + l1 + 3
     }
 
+    fn compile_match(rec: fn(&Self, &NameTable<Word>, &mut Vec<Instr>) -> u64,
+        name_table: &NameTable<Word>, out: &mut Vec<Instr>,
+        e: &Box<Expr>, pat: &[(u64, usize)], default: usize, es: &[Box<Expr>])
+        -> u64
+    {
+        assert!(e.is_var());
+        let mut jumpz = vec![];
+        let mut l = 0;
+        for &(p, i) in pat.iter() {
+            let x = e.compile_non_tail(name_table, out);
+            assert_eq!(x, 1);
+            out.push(Instr::PushA);
+            out.push(Instr::Load(Word::try_from(p).unwrap()));
+            out.push(Instr::Cmp);
+            jumpz.push((out.len(), i));
+            out.push(Instr::Halt);
+            l += 5;
+        }
+        // This is always a Branch(1) in this integer_with_default setting, so it can be omitted.
+        // let jump_default = out.len();
+        // out.push(Instr::Halt);
+        // l += 1;
+
+        assert!(es.len() >= 1);
+        let mut jump_end = vec![];
+        let mut blocks = vec![out.len()];
+        l += (rec)(&es[0], name_table, out);
+        for e in &es[1..] {
+            jump_end.push(out.len());
+            out.push(Instr::Halt);
+            blocks.push(out.len());
+            let l0 = (rec)(e, name_table, out);
+            l += l0 + 1;
+        }
+        let end = out.len();
+
+        for &(addr, label) in jumpz.iter() {
+            out[addr] = Instr::JumpZ((blocks[label] - addr).into());
+        }
+        // out[jump_default] = Instr::Branch((blocks[default] - jump_default).into());
+        for &addr in jump_end.iter() {
+            out[addr] = Instr::Branch((end - addr).into());
+        }
+        l
+    }
+
     pub fn compile(&self, name_table: &NameTable<Word>, out: &mut Vec<Instr>) {
         let _ = self.compile_tail(name_table, out);
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
-pub struct Name(Rc<String>);
-
-impl From<Rc<String>> for Name {
-    fn from(v: Rc<String>) -> Self {
-        Self(v)
-    }
-}
-
-impl Borrow<str> for Name {
-    fn borrow(&self) -> &str {
-        (*self.0).as_str()
-    }
-}
-
 pub struct NameTable<T> {
-    data: HashMap<Name, T>
+    data: HashMap<Identifier, T>
 }
 
 impl<T> NameTable<T> {
@@ -263,18 +341,18 @@ impl<T> NameTable<T> {
         NameTable { data: HashMap::new() }
     }
 
-    fn lookup(&self, name: &str) -> &T {
+    fn lookup(&self, name: &Identifier) -> &T {
         self.data.get(name).unwrap()
     }
 
-    fn try_lookup(&self, name: &str) -> TResult<&T> {
+    fn try_lookup(&self, name: &Identifier) -> TResult<&T> {
         match self.data.get(name) {
             Some(t) => Ok(t),
             None => Err(TypeError::Undefined(name.to_string())),
         }
     }
 
-    pub fn insert<K: Into<Name>>(&mut self, k: K, v: T) {
+    pub fn insert<K: Into<Identifier>>(&mut self, k: K, v: T) {
         let _ = self.data.insert(k.into(), v);
     }
 }
@@ -282,7 +360,7 @@ impl<T> NameTable<T> {
 type Global = NameTable<Type>;
 
 impl Function {
-    pub fn new<T: Into<Rc<String>>>(name: T, ty: Type, body: Box<Expr>) -> Function {
+    pub fn new<T: Into<Identifier>>(name: T, ty: Type, body: Box<Expr>) -> Function {
         Function {
             name: name.into(),
             ty,

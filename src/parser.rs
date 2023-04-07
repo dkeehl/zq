@@ -1,5 +1,5 @@
 use crate::lexer::{Lexer, LToken, Token::{self,*}, Keyword, Operator, Delimiter, Location};
-use crate::ast::{Ast, Definition, Item};
+use crate::ast::{Ast, Definition, Item, Pattern, Identifier};
 use crate::ir::Type;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -8,11 +8,20 @@ use std::rc::Rc;
 type PResult<T> = Result<T, PError>;
 
 pub struct PState {
+    counter: usize,
 }
 
 impl PState {
     pub fn new() -> Self {
-        PState {}
+        PState {
+            counter: 0,
+        }
+    }
+
+    fn fresh_name(&mut self) -> usize {
+        let res = self.counter;
+        self.counter += 1;
+        res
     }
 }
 
@@ -296,6 +305,10 @@ fn success(input: &mut Lexer, state: &mut PState) -> PResult<()> {
     Ok(())
 }
 
+fn fresh_name(input: &mut Lexer, state: &mut PState) -> PResult<usize> {
+    Ok(state.fresh_name())
+}
+
 //
 // atomic
 //
@@ -418,7 +431,7 @@ where P: for<'a> Parser<'a, Output=T> + Clone
 }
 
 fn expression() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
-    boxed(choice!(p_let(), lambda(), p_operator_expression()))
+    boxed(choice!(p_let(), p_match(), lambda(), p_operator_expression()))
 }
 
 fn p_atomic() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
@@ -434,8 +447,9 @@ fn p_identifier() -> impl for<'a> Parser<'a, Output=Ast> + Clone {
     ident().map(Ast::Ident)
 }
 
-fn ident() -> impl for<'a> Parser<'a, Output=String> + Clone {
-    (identifier).map(str::to_string)
+fn ident() -> impl for<'a> Parser<'a, Output=Identifier> + Clone {
+    let f = |s: &str| Identifier::Src(Rc::new(s.to_string()));
+    (identifier).map(f)
 }
 
 fn ty() -> impl for<'a> Parser<'a, Output=Type> + Clone {
@@ -494,6 +508,52 @@ fn lambda() -> impl for<'a> Parser<'a, Output=Ast> {
         token(TkDelim(Delimiter::FatArrow)),
         delay(expression))
         .map(|(_, ((x, t), (_, e)))| Ast::lam(x, t, e))
+}
+
+fn pattern() -> impl for<'a> Parser<'a, Output=Pattern> {
+    let int = seq!(integer, zero_or_more(seq!(token(TkOp(Operator::Or)), integer)))
+        .map(|(i, v)| if v.is_empty() {
+            Pattern::Int(i)
+        } else {
+            let mut ps = vec![i];
+            v.into_iter().for_each(|(_, p)| ps.push(p));
+            Pattern::Or(ps)
+        });
+    let var = ident().map(Pattern::Var);
+    choice!(int, var)
+}
+
+fn arm() -> impl for<'a> Parser<'a, Output=(Pattern, Rc<Ast>)> {
+    seq!(pattern(), token(TkDelim(Delimiter::FatArrow)), delay(expression))
+        .map(|(p, (_, a))| (p, Rc::new(a)))
+}
+
+fn in_brace<P, T>(p: P) -> impl for<'a> Parser<'a, Output=T>
+where P: for<'a> Parser<'a, Output=T>
+{
+    seq!(token(TkDelim(Delimiter::BraceL)), p, token(TkDelim(Delimiter::BraceR)))
+        .map(|(_, (x, _))| x)
+}
+
+fn match_block() -> impl for<'a> Parser<'a, Output=Vec<(Pattern, Rc<Ast>)>> {
+    let arms = zero_or_more(
+        seq!(arm(), token(TkDelim(Delimiter::SemiColon))).map(|(x, _)| x));
+    in_brace(arms)
+}
+
+fn p_match() -> impl for<'a> Parser<'a, Output=Ast> {
+    seq!(token(TkKeyWord(Keyword::Match)),
+        delay(expression),
+        token(TkKeyWord(Keyword::With)),
+        match_block(),
+        fresh_name)
+        .map(|(_, (e, (_, (arms, x))))| match e {
+            Ast::Ident(var) => Ast::Match(var, Rc::new(arms)),
+            _ => {
+                let x = Identifier::Gen(x);
+                Ast::local(x.clone(), e, Ast::Match(x, Rc::new(arms)))
+            }
+        })
 }
 
 fn function_def() -> impl for<'a> Parser<'a, Output=Definition> {

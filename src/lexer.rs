@@ -74,6 +74,7 @@ pub enum Operator {
     GTE,
     LT,
     LTE,
+    Or,
 }
 
 impl fmt::Display for Operator {
@@ -88,6 +89,7 @@ impl Operator {
         match self {
             Plus | Minus => (40, 41),    
             Star | Slash => (50, 51),   
+            Or => (10, 11),
             EQ | GT | GTE | LT | LTE => (31, 30),   
         }
     }
@@ -103,6 +105,7 @@ impl Operator {
             Operator::GTE   => ">=",
             Operator::LT    => "<",
             Operator::LTE   => "<=",
+            Operator::Or    => "|",
         }
     }
 
@@ -114,6 +117,7 @@ impl Operator {
             '/' => Operator::Slash,
             '>' => Operator::GT,
             '<' => Operator::LT,
+            '|' => Operator::Or,
             _ => unreachable!(),
         }
     }
@@ -124,6 +128,8 @@ pub enum Keyword {
     Let,
     In,
     Fun,
+    Match,
+    With,
 }
 
 impl fmt::Display for Keyword {
@@ -138,6 +144,8 @@ impl Keyword {
             Keyword::Let =>  "let",
             Keyword::In => "in",
             Keyword::Fun =>  "fun",
+            Keyword::Match => "match",
+            Keyword::With => "with",
         }
     }
 }
@@ -254,7 +262,7 @@ impl<'a> Scanner<'a> {
                     },
                 },
 
-                c @ ('+' | '-' | '*') => match self.state {
+                c @ ('+' | '-' | '*' | '|') => match self.state {
                     StComment => {},
                     Start => {
                         let op = Operator::parse_char(c);
@@ -400,6 +408,16 @@ impl<'a> Scanner<'a> {
             },
             'f' => if s.starts_with("un") {
                 (StKeyword(Keyword::Fun), 2)
+            } else {
+                (StIdent, 0)
+            },
+            'm' => if s.starts_with("atch") {
+                (StKeyword(Keyword::Match), 4)
+            } else {
+                (StIdent, 0)
+            },
+            'w' => if s.starts_with("ith") {
+                (StKeyword(Keyword::With), 3)
             } else {
                 (StIdent, 0)
             },

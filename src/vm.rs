@@ -121,9 +121,12 @@ pub enum Instr {
     PushMark,
     PushA,
     Fetch(Word),
+    JumpZ(Word),
+    Branch(Word),
 
     Add,
     Sub,
+    Cmp,
 }
 
 impl fmt::Display for Instr {
@@ -142,8 +145,12 @@ impl fmt::Display for Instr {
             Instr::PushMark => write!(f, "push_mark"),
             Instr::PushA => write!(f, "pusha"),
             Instr::Fetch(Word(n)) => write!(f, "fetch {}", n),
+            Instr::JumpZ(Word(n)) => write!(f, "if_zero_jump {}", n),
+            Instr::Branch(Word(n)) => write!(f, "branch {}", n),
+
             Instr::Add => write!(f, "add"),
-            Instr::Sub=> write!(f, "sub"),
+            Instr::Sub => write!(f, "sub"),
+            Instr::Cmp => write!(f, "cmp"),
         }
     }
 }
@@ -276,9 +283,17 @@ impl VM {
                     self.a = self.heap.read(self.env, offset);
                     self.pc.add1();
                 },
+                Instr::JumpZ(n) => if self.a.0 == 0 {
+                    self.pc = self.pc + n;
+                } else {
+                    self.pc.add1();
+                },
+                Instr::Branch(n) => self.pc = self.pc + n,
+
 
                 Instr::Add => self.prim2(primitive::add),
                 Instr::Sub => self.prim2(primitive::sub),
+                Instr::Cmp => self.prim2(primitive::cmp),
             }
         }
     }
@@ -384,6 +399,14 @@ pub mod primitive {
             let x: i64 = transmute(x.0);
             let y: i64 = transmute(y.0);
             Word(transmute(x - y + 1))
+        }
+    }
+
+    pub fn cmp(x: Word, y: Word) -> Word {
+        if x.0 == y.0 {
+            Word(0)
+        } else {
+            Word(1)
         }
     }
 }

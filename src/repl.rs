@@ -6,10 +6,28 @@ use crate::vm::{VM, Program, Word, Instr};
 use crate::ir::{NameTable, Type, Gamma,};
 
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::Editor;
+use rustyline::{Completer, Helper, Highlighter, Hinter, Validator};
+use rustyline::validate::MatchingBracketValidator;
+
+#[derive(Completer, Helper, Highlighter, Hinter, Validator)]
+struct InputValidator {
+    #[rustyline(Validator)]
+    brackets: MatchingBracketValidator,
+}
+
+impl InputValidator {
+    fn new() -> Self {
+        Self {
+            brackets: MatchingBracketValidator::new(),
+        }
+    }
+}
 
 pub fn run_repl() {
-    let mut rl = DefaultEditor::new().unwrap();
+    let h = InputValidator::new();
+    let mut rl = Editor::new().unwrap();
+    rl.set_helper(Some(h));
     let mut interp = Interpretor::new();
     loop {
         let readline = rl.readline(">> ");
@@ -69,9 +87,7 @@ impl Interpretor {
                 let t = e.typing(&mut gamma, &self.global)?;
                 let _ = e.compile_non_tail(&self.name_table, &mut self.buffer);
                 self.buffer.push(Instr::Halt);
-                // for i in self.buffer.iter() {
-                //     println!("{}", i);
-                // }
+                // self.print_buf();
                 let addr = self.prog.append(&mut self.buffer);
                 let res = self.vm.run(&self.prog, addr);
                 self.vm.print(res, &t);
@@ -79,6 +95,7 @@ impl Interpretor {
             },
             Item::FunDef(f) => {
                 let f = f.de_bruijn_index();
+                // println!("{:?}", f);
                 let mut gamma = Gamma::new();
                 f.type_check(&mut gamma, &self.global)?;
                 self.global.insert(f.name.clone(), f.ty.clone());
@@ -88,6 +105,12 @@ impl Interpretor {
             },
         }
         Ok(())
+    }
+
+    fn print_buf(&self) {
+        for i in self.buffer.iter() {
+            println!("{}", i);
+        }
     }
 }
 
