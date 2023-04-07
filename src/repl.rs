@@ -97,11 +97,15 @@ impl Interpretor {
                 let f = f.de_bruijn_index();
                 // println!("{:?}", f);
                 let mut gamma = Gamma::new();
-                f.type_check(&mut gamma, &self.global)?;
                 self.global.insert(f.name.clone(), f.ty.clone());
+                if let Err(e) = f.type_check(&mut gamma, &self.global) {
+                    self.global.remove(&f.name);
+                    return Err(e.into());
+                }
+                let addr = self.prog.size();
+                self.name_table.insert(f.name.clone(), addr.into());
                 f.compile(&self.name_table, &mut self.buffer);
-                let addr = self.prog.append(&mut self.buffer);
-                self.name_table.insert(f.name.clone(), addr);
+                self.prog.append(&mut self.buffer);
             },
         }
         Ok(())

@@ -170,6 +170,10 @@ impl Program {
         Program { data: vec![] }
     }
     
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
+
     pub fn append(&mut self, ins: &mut Vec<Instr>) -> Word {
         let addr = self.data.len();
         self.data.append(ins);

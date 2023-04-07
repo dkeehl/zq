@@ -364,6 +364,10 @@ impl<T> NameTable<T> {
     pub fn insert<K: Into<Identifier>>(&mut self, k: K, v: T) {
         let _ = self.data.insert(k.into(), v);
     }
+
+    pub fn remove(&mut self, k: &Identifier) {
+        let _ = self.data.remove(k);
+    }
 }
 
 type Global = NameTable<Type>;
